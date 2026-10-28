@@ -22,24 +22,23 @@ namespace GilbAnalyzer.Core;
 ///   * оператор switch дает вклад в CL, равный количеству ветвей case
 ///     (ветка default не учитывается).
 ///
-/// Максимальный уровень вложенности CLI (считается от 0):
+/// Каскадная вложенность CLI (считается от 0):
 ///   * Одиночный условный оператор или цикл на верхнем уровне имеет уровень 0.
-///   * Условие, вложенное в цикл, имеет уровень 1 (и т.д.).
-///   * Конструкция switch с n ветвями case образует каскад, формируя
-///     собственную вложенность (n - 1).
+///   * Оператор switch создает каскад, где каждая ветвь case добавляет +1 к уровню
+///     вложенности относительно предыдущей ветви.
 /// </summary>
 public static class GilbCalculator
 {
-    private enum CondKind { If, For, While, Do, Switch, Ternary }
+    private enum CondKind { If, For, While, Do, Switch, Case, Ternary }
 
     private sealed class Conditional
     {
         public CondKind Kind;
         public int HeaderPos;      // индекс токена-заголовка
-        public int SpanStart;      // левая граница охвата (эксклюзивно)
-        public int SpanEnd;        // правая граница охвата (эксклюзивно)
+        public int SpanStart;      // левая граница охвата
+        public int SpanEnd;        // правая граница охвата
         public int EnclosingWeight;// сколько уровней вложенности добавляет дочерним элементам
-        public int SelfNesting;    // собственная максимальная вложенность (например, для switch)
+        public int SelfNesting;    // собственная максимальная вложенность
         public int Branches;       // для switch — число ветвей case
     }
 
@@ -90,14 +89,14 @@ public static class GilbCalculator
                     }
                     case "while":
                     {
-                        if (doTailWhile.Contains(i)) break; 
+                        if (doTailWhile.Contains(i)) break;
                         conds.Add(MakeHeaderCond(t, i, parenMatch, braceMatch, CondKind.While));
                         whileCount++;
                         break;
                     }
                     case "switch":
                     {
-                        var c = MakeSwitchCond(t, i, parenMatch, braceMatch, curlyDepth);
+                        var c = MakeSwitchCond(t, i, parenMatch, braceMatch, curlyDepth, conds);
                         conds.Add(c);
                         switchCount++;
                         switchBranches += c.Branches;
@@ -121,7 +120,6 @@ public static class GilbCalculator
         }
 
         // ----- Абсолютная сложность CL -----
-        // Вклад switch равен строго количеству веток case (default проигнорирован)
         int switchCLContribution = conds.Where(c => c.Kind == CondKind.Switch).Sum(c => c.Branches);
         int loops = forCount + whileCount + doCount;
         int cl = ifCount + loops + ternaryCount + switchCLContribution;
@@ -134,12 +132,11 @@ public static class GilbCalculator
         int cli = 0;
         foreach (var c in conds)
         {
-            // Считаем количество внешних конструкций, охватывающих текущую
+            // Количество охватывающих конструкций и предшествующих case в каскаде
             int enclosing = conds
                 .Where(d => d != c && d.SpanStart < c.HeaderPos && c.HeaderPos < d.SpanEnd)
                 .Sum(d => d.EnclosingWeight);
             
-            // Уровень = кол-во охватывающих конструкций + собственная глубина конструкции
             int level = enclosing + c.SelfNesting;
             
             if (level > cli) cli = level;
@@ -199,7 +196,7 @@ public static class GilbCalculator
         var c = new Conditional { Kind = CondKind.Do, HeaderPos = i, EnclosingWeight = 1, SelfNesting = 0 };
         SetBodySpan(t, c, i + 1, braceMatch);
 
-        int afterBody = c.SpanEnd; 
+        int afterBody = c.SpanEnd;
         for (int k = afterBody + 1; k < t.Count; k++)
         {
             if (t[k].Kind == TokenKind.Keyword && t[k].Text == "while")
@@ -214,32 +211,39 @@ public static class GilbCalculator
 
     private static Conditional MakeSwitchCond(
         List<Token> t, int i, Dictionary<int, int> parenMatch,
-        Dictionary<int, int> braceMatch, int[] curlyDepth)
+        Dictionary<int, int> braceMatch, int[] curlyDepth, List<Conditional> conds)
     {
-        var c = new Conditional { Kind = CondKind.Switch, HeaderPos = i };
+        var c = new Conditional { Kind = CondKind.Switch, HeaderPos = i, EnclosingWeight = 0, SelfNesting = 0 };
         int lparen = NextIndex(t, i, "(");
         int bodyStart = (lparen >= 0 && parenMatch.TryGetValue(lparen, out int rparen))
             ? rparen + 1 : i + 1;
 
         SetBodySpan(t, c, bodyStart, braceMatch);
 
-        // Подсчёт ветвей (только case, default игнорируем)
+        // Каждый case создает последовательный каскад (каждый следующий case дает +1 к вложенности)
         int cases = 0;
         if (c.SpanStart >= 0 && c.SpanEnd > c.SpanStart)
         {
-            int innerDepth = curlyDepth[c.SpanStart] + 1; 
+            int innerDepth = curlyDepth[c.SpanStart] + 1;
             for (int k = c.SpanStart + 1; k < c.SpanEnd; k++)
             {
                 if (t[k].Kind == TokenKind.Keyword && t[k].Text == "case" && curlyDepth[k] == innerDepth)
                 {
                     cases++;
+                    conds.Add(new Conditional
+                    {
+                        Kind = CondKind.Case,
+                        HeaderPos = k,
+                        SpanStart = k,
+                        SpanEnd = c.SpanEnd,
+                        EnclosingWeight = 1,
+                        SelfNesting = 0
+                    });
                 }
             }
         }
         
         c.Branches = cases;
-        c.EnclosingWeight = 1; // Рассматриваем весь блок switch как 1 уровень для элементов внутри него
-        c.SelfNesting = Math.Max(cases - 1, 0); // Собственная вложенность ветвей друг в друга (3 кейса = уровень 2)
         return c;
     }
 
@@ -274,7 +278,7 @@ public static class GilbCalculator
             if (elseBody < t.Count && t[elseBody].Kind == TokenKind.Punctuator && t[elseBody].Text == "{"
                 && braceMatch.TryGetValue(elseBody, out int elseClose))
             {
-                c.SpanEnd = elseClose; 
+                c.SpanEnd = elseClose;
             }
         }
     }
